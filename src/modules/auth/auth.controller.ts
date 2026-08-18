@@ -6,6 +6,7 @@ import {
   HttpStatus,
   Post,
   Res,
+  UnauthorizedException,
   UseGuards,
 } from '@nestjs/common';
 import {
@@ -19,20 +20,20 @@ import type { Response } from 'express';
 import { ConfigService } from '@nestjs/config';
 import { AuthService } from './auth.service';
 import { LoginDto } from './dto/login.dto';
+import { GoogleLoginDto } from './dto/google-login.dto';
 import { AccessTokenBodyDto, AuthBodyDto } from './dto/auth-response.dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { JwtRefreshGuard } from './guards/jwt-refresh.guard';
-import { GoogleAuthGuard } from './guards/google-auth.guard';
 import { CreateUserDto } from '../users/dto/create-user.dto';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { REFRESH_COOKIE, refreshCookieOptions } from './refresh-cookie';
+import { verifyGoogleIdToken } from './google-token';
 // `import type` is required here: these are interfaces used in decorated
 // method signatures, and they must not survive into the emitted JavaScript.
 import type {
   AuthenticatedUser,
   RefreshRequestUser,
 } from '../../common/interfaces/jwt-payload.interface';
-import type { GoogleUser } from './strategies/google.strategy';
 
 @ApiTags('Authentication')
 @Controller('auth')
@@ -117,39 +118,32 @@ export class AuthController {
   }
 
   /**
-   * Step 1 of Google sign-in. The guard redirects the browser to Google's
-   * consent screen, so this method body never actually runs. Open this URL in
-   * the browser (a normal link/redirect), not via fetch.
+   * Google sign-in for @react-oauth/google. The frontend does the popup and
+   * sends us the Google ID token ("credential"). We verify it with Google,
+   * find-or-create the user, and issue OUR tokens exactly like a normal login.
    */
-  @Get('google')
-  @UseGuards(GoogleAuthGuard)
-  @ApiOperation({ summary: 'Start Google sign-in (redirects to Google)' })
-  googleAuth(): void {
-    // intentionally empty — GoogleAuthGuard does the redirect
-  }
+  @Post('google')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Verify a Google ID token and sign in' })
+  @ApiResponse({ status: 200, type: AuthBodyDto })
+  @ApiResponse({ status: 401, description: 'Invalid Google token' })
+  async google(
+    @Body() googleLoginDto: GoogleLoginDto,
+    @Res({ passthrough: true }) response: Response,
+  ): Promise<AuthBodyDto> {
+    const clientId = this.configService.getOrThrow<string>('GOOGLE_CLIENT_ID');
 
-  /**
-   * Step 2. Google sends the user back here. The guard has already turned the
-   * code into a profile (request.user). We create-or-find the account, set the
-   * refresh cookie, and bounce back to the frontend with the access token in
-   * the URL fragment (after #) — fragments are not sent to servers or logged,
-   * and the SPA reads it straight into memory.
-   */
-  @Get('google/callback')
-  @UseGuards(GoogleAuthGuard)
-  @ApiOperation({ summary: 'Google redirects here; finishes sign-in' })
-  async googleCallback(
-    @CurrentUser() googleUser: GoogleUser,
-    @Res() response: Response,
-  ): Promise<void> {
-    const { accessToken, refreshToken } =
+    let googleUser;
+    try {
+      googleUser = await verifyGoogleIdToken(googleLoginDto.credential, clientId);
+    } catch {
+      throw new UnauthorizedException('Invalid Google token');
+    }
+
+    const { accessToken, refreshToken, user } =
       await this.authService.loginWithGoogle(googleUser);
     this.setRefreshCookie(response, refreshToken);
-
-    const frontendUrl = this.configService.getOrThrow<string>('FRONTEND_URL');
-    response.redirect(
-      `${frontendUrl}/oauth/callback#accessToken=${accessToken}`,
-    );
+    return { accessToken, user };
   }
 
   @Get('me')

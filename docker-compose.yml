@@ -1,0 +1,44 @@
+# Local dev infrastructure for the FinSight backend.
+# Start with:  docker compose up -d      Stop with:  docker compose down
+#
+# - postgres : the app database (data persists in the named volume)
+# - adminer  : a lightweight DB web UI at http://localhost:4444
+#              (login: System=PostgreSQL, Server=postgres, User=postgres, Password=secret, Database=finsight)
+#
+# Note: the old `version:` key is obsolete in modern Compose and intentionally omitted.
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: finsight-postgres
+    restart: always
+    ports:
+      - "5432:5432"
+    networks:
+      - local
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: finsight
+
+  adminer:
+    image: adminer:latest
+    container_name: finsight-adminer
+    depends_on:
+      - postgres
+    restart: always
+    ports:
+      - "4444:8080"
+    networks:
+      - local
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+
+networks:
+  local:
+    driver: bridge
+
+volumes:
+  postgres:

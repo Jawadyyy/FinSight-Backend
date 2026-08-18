@@ -13,7 +13,7 @@ import { LoginDto } from './dto/login.dto';
 import { AuthResponseDto } from './dto/auth-response.dto';
 import { TokensDto } from './dto/tokens.dto';
 import { JwtPayload } from '../../common/interfaces/jwt-payload.interface';
-import { GoogleUser } from './strategies/google.strategy';
+import { GoogleUser } from './google-token';
 
 @Injectable()
 export class AuthService {
