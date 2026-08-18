@@ -8,11 +8,15 @@ import {
   Param,
   Query,
   UseGuards,
+  UseInterceptors,
+  UploadedFile,
   HttpCode,
   HttpStatus,
   ParseUUIDPipe,
+  BadRequestException,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { ApiBearerAuth, ApiConsumes, ApiTags } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../../common/interfaces/jwt-payload.interface';
@@ -35,6 +39,28 @@ export class TransactionsController {
     @Body() dto: CreateTransactionDto,
   ) {
     return this.transactionsService.create(user.id, dto);
+  }
+
+  @Post('upload')
+  @HttpCode(HttpStatus.CREATED)
+  @ApiConsumes('multipart/form-data')
+  @UseInterceptors(FileInterceptor('file', {
+    limits: { fileSize: 5 * 1024 * 1024 },
+    fileFilter: (_req, file, cb) => {
+      const allowed = ['text/csv', 'application/pdf', 'application/vnd.ms-excel'];
+      if (allowed.includes(file.mimetype) || file.originalname.match(/\.(csv|pdf)$/i)) {
+        cb(null, true);
+      } else {
+        cb(new BadRequestException('Only CSV and PDF files are allowed'), false);
+      }
+    },
+  }))
+  upload(
+    @CurrentUser() user: AuthenticatedUser,
+    @UploadedFile() file: Express.Multer.File,
+  ) {
+    if (!file) throw new BadRequestException('No file uploaded');
+    return this.transactionsService.upload(user.id, file);
   }
 
   @Get()
