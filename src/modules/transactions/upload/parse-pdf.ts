@@ -12,18 +12,20 @@ const MONTHS: Record<string, string> = {
   jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12',
 };
 
-// Matches dates like: 01 Aug 2026, 02/08/2026, 03-08-2026, 05/08/26, 2026-08-01
 const DATE_PATTERN =
-  /(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{2,4})|(\d{1,4})[\/\-](\d{1,2})[\/\-](\d{2,4})/i;
+  /(\d{1,2})[\s\-]+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[\s\-]+(\d{2,4})|(\d{1,4})[\/\-](\d{1,2})[\/\-](\d{2,4})/i;
 
-// Matches amounts like: -850.00, +185000.00, -1,240.50, -500, +10,000
-const AMOUNT_PATTERN = /([+\-])?\$?([\d,]+(?:\.\d{1,2})?)\s*$/;
+// Finds all number groups in a string (e.g. "15,000.00", "130320.50", "1850")
+const ALL_AMOUNTS_PATTERN = /[\d,]+(?:\.\d{1,2})?/g;
 
-// Lines to skip
-const NOISE_PATTERN = /^-{2,}|^page|^statement|^opening|^closing|^footer|^customer|^account|^this document/i;
+const NOISE_PATTERN =
+  /^-{2,}|^\*{2,}|^page\s|^statement|^opening\s|^closing\s|^footer|^customer|^account\s|^this\s+(document|statement)|continued\s+on|─|^date\s+desc|^balance\b|^total\s|^e&oe/i;
+
+const INCOME_KEYWORDS =
+  /salary|credit|refund|return|deposit|received|freelance|upwork|fiverr|interest|dividend|cashback|bonus/i;
 
 function normalizeDate(raw: string): string | null {
-  const monthMatch = raw.match(/(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{2,4})/i);
+  const monthMatch = raw.match(/(\d{1,2})[\s\-]+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[\s\-]+(\d{2,4})/i);
   if (monthMatch) {
     const day = monthMatch[1].padStart(2, '0');
     const month = MONTHS[monthMatch[2].toLowerCase()];
@@ -35,18 +37,48 @@ function normalizeDate(raw: string): string | null {
   const slashMatch = raw.match(/(\d{1,4})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
   if (slashMatch) {
     let [, a, b, c] = slashMatch;
-    if (c.length === 2) c = '20' + c;
 
-    // If first part is 4 digits → YYYY-MM-DD
     if (a.length === 4) {
       return `${a}-${b.padStart(2, '0')}-${c.padStart(2, '0')}`;
     }
 
-    // DD/MM/YYYY (common in Pakistan/UK bank statements)
+    if (c.length === 2) c = '20' + c;
+
     return `${c}-${b.padStart(2, '0')}-${a.padStart(2, '0')}`;
   }
 
   return null;
+}
+
+function parseAmount(s: string): number {
+  return parseFloat(s.replace(/,/g, ''));
+}
+
+function extractDescAndAmount(text: string): { description: string; amount: number } | null {
+  const matches: { value: number; index: number; raw: string }[] = [];
+  let m: RegExpExecArray | null;
+  const re = new RegExp(ALL_AMOUNTS_PATTERN.source, 'g');
+
+  while ((m = re.exec(text)) !== null) {
+    const val = parseAmount(m[0]);
+    if (!isNaN(val) && val > 0) {
+      matches.push({ value: val, index: m.index, raw: m[0] });
+    }
+  }
+
+  if (matches.length === 0) return null;
+
+  // Description = everything before the first amount
+  const firstMatch = matches[0];
+  const description = text.slice(0, firstMatch.index).trim();
+  if (!description) return null;
+
+  // Bank statement format: first amount = transaction, last = balance
+  // If only 1 amount, that's the transaction amount
+  const amount = firstMatch.value;
+  if (amount === 0) return null;
+
+  return { description, amount };
 }
 
 export async function parsePdf(buffer: Buffer): Promise<ParsedRow[]> {
@@ -54,86 +86,27 @@ export async function parsePdf(buffer: Buffer): Promise<ParsedRow[]> {
   const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
   const rows: ParsedRow[] = [];
 
-  let pendingDescription = '';
-  let pendingDate = '';
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
+  for (const line of lines) {
     if (NOISE_PATTERN.test(line)) continue;
 
     const dateMatch = line.match(DATE_PATTERN);
-    if (!dateMatch) {
-      if (pendingDate) {
-        // Continuation line — could have description, amount, or both
-        const contAmount = line.match(AMOUNT_PATTERN);
-        if (contAmount) {
-          const amountStr = contAmount[2].replace(/,/g, '');
-          const amount = parseFloat(amountStr);
-          const sign = contAmount[1];
-          const extraDesc = line.replace(AMOUNT_PATTERN, '').trim();
-          const fullDesc = (pendingDescription + (extraDesc ? ' ' + extraDesc : '')).trim();
-          if (!isNaN(amount) && amount !== 0 && fullDesc) {
-            rows.push({
-              date: pendingDate,
-              description: fullDesc,
-              amount,
-              type: sign === '+' ? 'income' : 'expense',
-            });
-          }
-          pendingDate = '';
-          pendingDescription = '';
-        } else {
-          pendingDescription += ' ' + line;
-        }
-      }
-      continue;
-    }
-
-    // Flush pending entry if a new date line starts
-    if (pendingDate && pendingDescription) {
-      // Previous entry had no amount — skip it (header row etc.)
-      pendingDate = '';
-      pendingDescription = '';
-    }
+    if (!dateMatch) continue;
 
     const dateStr = normalizeDate(line);
     if (!dateStr) continue;
 
-    // Extract everything after the date as potential description + amount
     const afterDate = line.replace(DATE_PATTERN, '').trim();
-    const amountMatch = afterDate.match(AMOUNT_PATTERN);
+    const result = extractDescAndAmount(afterDate);
+    if (!result) continue;
 
-    if (amountMatch) {
-      // Date + description + amount all on one line
-      const amountStr = amountMatch[2].replace(/,/g, '');
-      const amount = parseFloat(amountStr);
-      if (isNaN(amount) || amount === 0) continue;
+    const type = INCOME_KEYWORDS.test(result.description) ? 'income' : 'expense';
 
-      const sign = amountMatch[1];
-      const desc = afterDate.replace(AMOUNT_PATTERN, '').trim();
-      if (!desc) continue;
-
-      // Include any pending continuation
-      const fullDesc = pendingDescription
-        ? (pendingDescription + ' ' + desc).trim()
-        : desc;
-
-      rows.push({
-        date: dateStr,
-        description: fullDesc,
-        amount,
-        type: sign === '+' ? 'income' : 'expense',
-      });
-
-      pendingDate = '';
-      pendingDescription = '';
-    } else {
-      // Date + description but no amount yet (might be multi-line)
-      // Save for potential continuation
-      pendingDate = dateStr;
-      pendingDescription = afterDate;
-    }
+    rows.push({
+      date: dateStr,
+      description: result.description,
+      amount: result.amount,
+      type,
+    });
   }
 
   return rows;
