@@ -16,7 +16,7 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { ApiBearerAuth, ApiConsumes, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiConsumes, ApiQuery, ApiTags } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../../common/interfaces/jwt-payload.interface';
@@ -61,6 +61,20 @@ export class TransactionsController {
   ) {
     if (!file) throw new BadRequestException('No file uploaded');
     return this.transactionsService.upload(user.id, file);
+  }
+
+  @Post('categorize')
+  @HttpCode(HttpStatus.OK)
+  @ApiQuery({
+    name: 'all',
+    required: false,
+    description: 'Re-categorise every non-manual transaction, not just uncategorised ones',
+  })
+  categorize(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query('all') all?: string,
+  ) {
+    return this.transactionsService.categorize(user.id, all === 'true');
   }
 
   @Get()

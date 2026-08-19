@@ -1,7 +1,8 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
+import { In, IsNull, Not, Repository } from 'typeorm';
 import { createHash } from 'crypto';
+import { CategorizationService } from '../categorization/categorization.service';
 import {
   Transaction,
   TransactionCategory,
@@ -20,6 +21,7 @@ export class TransactionsService {
   constructor(
     @InjectRepository(Transaction)
     private readonly repo: Repository<Transaction>,
+    private readonly categorization: CategorizationService,
   ) {}
 
   async create(userId: string, dto: CreateTransactionDto): Promise<Transaction> {
@@ -58,8 +60,66 @@ export class TransactionsService {
 
   async update(userId: string, id: string, dto: UpdateTransactionDto): Promise<Transaction> {
     const tx = await this.findOne(userId, id);
+
+    // A category the user set themselves is final — mark it so later
+    // categorisation runs leave it alone.
+    if (dto.category && dto.category !== tx.category) {
+      tx.categorySource = 'manual';
+      tx.categoryConfidence = 1;
+    }
+
     Object.assign(tx, dto);
     return this.repo.save(tx);
+  }
+
+  /**
+   * Fills in categories for the user's transactions.
+   *
+   * Skips anything the user categorised by hand. By default it only touches
+   * rows nothing has classified yet, so re-running is cheap; `all` re-does
+   * every non-manual row, for when the rules or model have improved.
+   */
+  async categorize(userId: string, all = false) {
+    const where = all
+      ? { userId, categorySource: Not('manual' as const) }
+      : [
+          { userId, categorySource: IsNull() },
+          { userId, category: TransactionCategory.OTHER, categorySource: Not('manual' as const) },
+        ];
+
+    const pending = await this.repo.find({ where });
+    if (!pending.length) {
+      return { categorized: 0, byAi: 0, byRule: 0, aiEnabled: this.categorization.aiEnabled };
+    }
+
+    const results = await this.categorization.categorise(
+      pending.map((tx) => ({ description: tx.description, merchant: tx.merchant })),
+    );
+
+    const changed: Transaction[] = [];
+    let byAi = 0;
+    let byRule = 0;
+
+    results.forEach((result, i) => {
+      if (!result.categorySource) return;
+
+      pending[i].category = result.category;
+      pending[i].categoryConfidence = result.categoryConfidence;
+      pending[i].categorySource = result.categorySource;
+      changed.push(pending[i]);
+
+      if (result.categorySource === 'ai') byAi++;
+      else byRule++;
+    });
+
+    if (changed.length) await this.repo.save(changed);
+
+    return {
+      categorized: changed.length,
+      byAi,
+      byRule,
+      aiEnabled: this.categorization.aiEnabled,
+    };
   }
 
   async remove(userId: string, id: string): Promise<void> {
@@ -134,8 +194,17 @@ export class TransactionsService {
       return true;
     });
 
-    const entities = toInsert.map(({ row, hash }) =>
+    // Categorise before the insert so rows never appear as "Other" and then
+    // change under the user. Never throws — worst case everything stays Other.
+    const categories = await this.categorization.categorise(
+      toInsert.map(({ row }) => ({ description: row.description, merchant: row.merchant })),
+    );
+
+    const entities = toInsert.map(({ row, hash }, i) =>
       this.repo.create({
+        category: categories[i].category,
+        categoryConfidence: categories[i].categoryConfidence,
+        categorySource: categories[i].categorySource,
         userId,
         amount: row.amount,
         description: row.description,
@@ -151,7 +220,6 @@ export class TransactionsService {
         importHash: hash,
         date: row.date,
         type: row.type as TransactionType,
-        category: TransactionCategory.OTHER,
         source,
       }),
     );
