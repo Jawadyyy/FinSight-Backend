@@ -1,7 +1,14 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
-import { Transaction, TransactionCategory, TransactionSource } from './entities/transaction.entity';
+import { In, Repository } from 'typeorm';
+import { createHash } from 'crypto';
+import {
+  Transaction,
+  TransactionCategory,
+  TransactionSource,
+  TransactionType,
+} from './entities/transaction.entity';
+import type { ParseResult, ParsedRow } from './upload/types';
 import { CreateTransactionDto } from './dto/create-transaction.dto';
 import { UpdateTransactionDto } from './dto/update-transaction.dto';
 import { QueryTransactionsDto } from './dto/query-transactions.dto';
@@ -60,9 +67,27 @@ export class TransactionsService {
     await this.repo.remove(tx);
   }
 
+  /**
+   * Fingerprints an imported row so the same statement can be uploaded twice
+   * without creating duplicates. Same day, same amount, same narrative and the
+   * same running balance is the same transaction — the balance is what keeps
+   * two genuinely separate but identical-looking charges apart.
+   */
+  private importHash(userId: string, row: ParsedRow): string {
+    const parts = [
+      userId,
+      row.date,
+      row.amount.toFixed(2),
+      row.type,
+      row.description.replace(/\s+/g, ' ').trim().toLowerCase(),
+      row.balanceAfter === null ? '' : row.balanceAfter.toFixed(2),
+    ];
+    return createHash('sha256').update(parts.join('|')).digest('hex');
+  }
+
   async upload(userId: string, file: Express.Multer.File) {
     const mime = file.mimetype;
-    let parsed: { date: string; description: string; amount: number; type: 'income' | 'expense' }[];
+    let parsed: ParseResult;
 
     if (mime === 'text/csv' || file.originalname.endsWith('.csv')) {
       parsed = parseCsv(file.buffer);
@@ -72,7 +97,7 @@ export class TransactionsService {
       throw new BadRequestException('Only CSV and PDF files are supported');
     }
 
-    if (!parsed.length) {
+    if (!parsed.rows.length) {
       throw new BadRequestException('No transactions could be parsed from the file');
     }
 
@@ -80,19 +105,65 @@ export class TransactionsService {
       ? TransactionSource.PDF
       : TransactionSource.CSV;
 
-    const entities = parsed.map((row) =>
+    // Drop rows that repeat within this file before checking the database.
+    const seen = new Set<string>();
+    const unique: { row: ParsedRow; hash: string }[] = [];
+    let duplicates = 0;
+
+    for (const row of parsed.rows) {
+      const hash = this.importHash(userId, row);
+      if (seen.has(hash)) {
+        duplicates++;
+        continue;
+      }
+      seen.add(hash);
+      unique.push({ row, hash });
+    }
+
+    const existing = await this.repo.find({
+      where: { userId, importHash: In([...seen]) },
+      select: { importHash: true },
+    });
+    const alreadyImported = new Set(existing.map((e) => e.importHash));
+
+    const toInsert = unique.filter(({ hash }) => {
+      if (alreadyImported.has(hash)) {
+        duplicates++;
+        return false;
+      }
+      return true;
+    });
+
+    const entities = toInsert.map(({ row, hash }) =>
       this.repo.create({
         userId,
         amount: row.amount,
         description: row.description,
+        merchant: row.merchant,
+        reference: row.reference,
+        currency: row.currency,
+        originalAmount: row.originalAmount,
+        originalCurrency: row.originalCurrency,
+        balanceAfter: row.balanceAfter,
+        confidence: row.confidence,
+        needsReview: row.needsReview,
+        rawText: row.rawText,
+        importHash: hash,
         date: row.date,
-        type: row.type as any,
+        type: row.type as TransactionType,
         category: TransactionCategory.OTHER,
         source,
       }),
     );
 
-    const saved = await this.repo.save(entities);
-    return { imported: saved.length, skipped: 0 };
+    const saved = entities.length ? await this.repo.save(entities) : [];
+
+    return {
+      imported: saved.length,
+      skipped: parsed.rows.length - saved.length - duplicates,
+      duplicates,
+      needsReview: saved.filter((t) => t.needsReview).length,
+      warnings: parsed.warnings,
+    };
   }
 }
