@@ -8,6 +8,8 @@ import { UsersModule } from './modules/users/users.module';
 import { TransactionsModule } from './modules/transactions/transactions.module';
 import { BudgetsModule } from './modules/budgets/budgets.module';
 import { AnalyticsModule } from './modules/analytics/analytics.module';
+import { InsightsModule } from './modules/insights/insights.module';
+import { ReportsModule } from './modules/reports/reports.module';
 
 @Module({
   imports: [
@@ -33,6 +35,8 @@ import { AnalyticsModule } from './modules/analytics/analytics.module';
     TransactionsModule,
     BudgetsModule,
     AnalyticsModule,
+    InsightsModule,
+    ReportsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
