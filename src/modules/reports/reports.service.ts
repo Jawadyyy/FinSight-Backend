@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import * as Papa from 'papaparse';
-import PDFDocument from 'pdfkit';
+import * as ExcelJS from 'exceljs';
 import {
   Transaction,
   TransactionType,
@@ -10,8 +10,15 @@ import {
 import { Budget } from '../budgets/entities/budget.entity';
 import { InsightsService } from '../insights/insights.service';
 import { QueryReportDto } from './dto/query-report.dto';
+import { renderMonthlyReport } from './pdf-report';
+import { lastDayOfMonth } from '../../common/utils/month-range';
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
+
+const MONTH_NAMES = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+];
 
 /**
  * PDFKit's standard fonts are WinAnsi-encoded, so characters outside that set
@@ -104,15 +111,60 @@ export class ReportsService {
     );
   }
 
+  /** Month label like "August 2026" for report headings. */
+  private monthLabel(month: string): string {
+    const [year, m] = month.split('-').map(Number);
+    return `${MONTH_NAMES[m - 1]} ${year}`;
+  }
+
+  /** Income and spending for the N months ending at `month`, oldest first. */
+  private async monthlyTrend(userId: string, month: string, count: number) {
+    const [year, m] = month.split('-').map(Number);
+    const start = new Date(Date.UTC(year, m - count, 1)).toISOString().slice(0, 10);
+    const end = lastDayOfMonth(month);
+
+    const rows = await this.transactions
+      .createQueryBuilder('t')
+      .select("to_char(t.date, 'YYYY-MM')", 'month')
+      .addSelect('t.type', 'type')
+      .addSelect('SUM(t.amount)', 'total')
+      .where('t.userId = :userId', { userId })
+      .andWhere('t.date >= :start', { start })
+      .andWhere('t.date <= :end', { end })
+      .andWhere('t.type != :transfer', { transfer: TransactionType.TRANSFER })
+      .groupBy('month')
+      .addGroupBy('t.type')
+      .getRawMany<{ month: string; type: string; total: string }>();
+
+    const buckets = new Map<string, { income: number; expense: number }>();
+    for (const row of rows) {
+      const bucket = buckets.get(row.month) ?? { income: 0, expense: 0 };
+      if (row.type === TransactionType.INCOME) bucket.income = parseFloat(row.total);
+      else bucket.expense = parseFloat(row.total);
+      buckets.set(row.month, bucket);
+    }
+
+    // Include empty months so the chart shows a continuous timeline.
+    const series: { month: string; income: number; expense: number }[] = [];
+    for (let i = count - 1; i >= 0; i--) {
+      const d = new Date(Date.UTC(year, m - 1 - i, 1));
+      const key = d.toISOString().slice(0, 7);
+      const bucket = buckets.get(key) ?? { income: 0, expense: 0 };
+      series.push({ month: key, income: round2(bucket.income), expense: round2(bucket.expense) });
+    }
+    return series;
+  }
+
   async monthlyPdf(userId: string, month?: string): Promise<Buffer> {
     const target = month ?? new Date().toISOString().slice(0, 7);
     const from = `${target}-01`;
-    const to = `${target}-31`;
+    const to = lastDayOfMonth(target);
 
-    const [rows, budgetRows, insights] = await Promise.all([
+    const [rows, budgetRows, insights, monthly] = await Promise.all([
       this.scoped(userId, { from, to }).getMany(),
       this.budgets.find({ where: { userId, month: target }, order: { category: 'ASC' } }),
       this.insights.forMonth(userId, target),
+      this.monthlyTrend(userId, target, 6),
     ]);
 
     const currency = rows[0]?.currency ?? 'PKR';
@@ -125,142 +177,120 @@ export class ReportsService {
         .reduce((s, t) => s + Number(t.amount), 0),
     );
 
-    const byCategory = new Map<string, number>();
+    const totals = new Map<string, number>();
     for (const t of rows) {
       if (t.type !== TransactionType.EXPENSE) continue;
-      byCategory.set(t.category, round2((byCategory.get(t.category) ?? 0) + Number(t.amount)));
+      totals.set(t.category, round2((totals.get(t.category) ?? 0) + Number(t.amount)));
     }
 
-    return this.render((doc) => {
-      // --- header ---------------------------------------------------------
-      doc.fontSize(20).font('Helvetica-Bold').text('FinSight');
-      doc.fontSize(10).font('Helvetica').fillColor('#666')
-        .text(`Monthly report - ${target}`)
-        .text(`Generated ${new Date().toISOString().slice(0, 10)}`);
-      doc.fillColor('#000').moveDown(1);
+    const byCategory = [...totals.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([category, total]) => ({
+        category,
+        total,
+        percentage: expense ? Math.round((total / expense) * 1000) / 10 : 0,
+      }));
 
-      // --- summary --------------------------------------------------------
-      const savings = round2(income - expense);
-      const rate = income ? round2((savings / income) * 100) : 0;
+    const savings = round2(income - expense);
 
-      doc.fontSize(13).font('Helvetica-Bold').text('Summary');
-      doc.moveDown(0.4);
-      doc.fontSize(10).font('Helvetica');
-      this.row(doc, 'Income', money(income, currency));
-      this.row(doc, 'Spending', money(expense, currency));
-      this.row(doc, 'Net saved', money(savings, currency));
-      this.row(doc, 'Savings rate', `${rate}%`);
-      this.row(doc, 'Transactions', String(rows.length));
-      doc.moveDown(1);
-
-      // --- insights -------------------------------------------------------
-      if (insights.facts.length) {
-        doc.fontSize(13).font('Helvetica-Bold').text('Insights');
-        doc.moveDown(0.3);
-        doc.fontSize(10).font('Helvetica-Oblique')
-          .text(ascii(insights.summary), { width: 500 });
-        doc.moveDown(0.4);
-        doc.font('Helvetica');
-        for (const fact of insights.facts.slice(0, 6)) {
-          doc.text(`- ${ascii(fact.message)}`, { width: 500 });
-        }
-        doc.moveDown(1);
-      }
-
-      // --- spending by category -------------------------------------------
-      if (byCategory.size) {
-        doc.fontSize(13).font('Helvetica-Bold').text('Spending by category');
-        doc.moveDown(0.4);
-        doc.fontSize(10).font('Helvetica');
-        for (const [category, total] of [...byCategory.entries()].sort((a, b) => b[1] - a[1])) {
-          const share = expense ? Math.round((total / expense) * 1000) / 10 : 0;
-          this.row(doc, category, `${money(total, currency)}  (${share}%)`);
-        }
-        doc.moveDown(1);
-      }
-
-      // --- budgets ---------------------------------------------------------
-      if (budgetRows.length) {
-        doc.fontSize(13).font('Helvetica-Bold').text('Budget vs actual');
-        doc.moveDown(0.4);
-        doc.fontSize(10).font('Helvetica');
-        for (const b of budgetRows) {
-          const spent = byCategory.get(b.category) ?? 0;
-          const diff = round2(Number(b.limit) - spent);
-          const status = diff < 0 ? `OVER by ${money(-diff, currency)}` : `${money(diff, currency)} left`;
-          this.row(doc, b.category, `${money(spent, currency)} of ${money(Number(b.limit), currency)}  -  ${status}`);
-        }
-        doc.moveDown(1);
-      }
-
-      // --- transactions ----------------------------------------------------
-      doc.fontSize(13).font('Helvetica-Bold').text('Transactions');
-      doc.moveDown(0.4);
-
-      const cols = [50, 115, 300, 380, 470];
-      const header = () => {
-        doc.fontSize(9).font('Helvetica-Bold');
-        doc.text('Date', cols[0], doc.y, { continued: false });
-        const y = doc.y - 11;
-        doc.text('Merchant', cols[1], y);
-        doc.text('Category', cols[2], y);
-        doc.text('Type', cols[3], y);
-        doc.text('Amount', cols[4], y, { width: 90, align: 'right' });
-        doc.moveDown(0.3);
-        doc.moveTo(50, doc.y).lineTo(560, doc.y).strokeColor('#ccc').stroke();
-        doc.moveDown(0.3);
-        doc.font('Helvetica');
-      };
-
-      header();
-
-      for (const t of rows) {
-        // Leave room for the footer rather than letting a row straddle pages.
-        if (doc.y > 720) {
-          doc.addPage();
-          header();
-        }
-        const y = doc.y;
-        doc.fontSize(9);
-        doc.text(t.date, cols[0], y, { width: 60 });
-        doc.text(ascii(t.merchant ?? t.description).slice(0, 28), cols[1], y, { width: 180 });
-        doc.text(t.category, cols[2], y, { width: 75 });
-        doc.text(t.type, cols[3], y, { width: 85 });
-        doc.text(
-          `${t.type === 'income' ? '+' : t.type === 'expense' ? '-' : ''}${money(Number(t.amount), t.currency)}`,
-          cols[4],
-          y,
-          { width: 90, align: 'right' },
-        );
-        doc.moveDown(0.55);
-      }
+    return renderMonthlyReport({
+      month: target,
+      monthLabel: this.monthLabel(target),
+      currency,
+      generatedAt: new Date().toISOString().slice(0, 10),
+      income,
+      expense,
+      savings,
+      savingsRate: income ? round2((savings / income) * 100) : 0,
+      transactionCount: rows.length,
+      monthly,
+      byCategory,
+      budgets: budgetRows.map((b) => ({
+        category: b.category,
+        limit: round2(Number(b.limit)),
+        spent: totals.get(b.category) ?? 0,
+      })),
+      insights: {
+        headline: insights.headline,
+        summary: insights.summary,
+        aiGenerated: insights.aiGenerated,
+        facts: insights.facts.map((f) => ({ severity: f.severity, message: f.message })),
+      },
+      transactions: rows.map((t) => ({
+        date: t.date,
+        merchant: t.merchant ?? t.description,
+        category: t.category,
+        type: t.type,
+        amount: Number(t.amount),
+        currency: t.currency,
+      })),
     });
   }
 
-  /** Label on the left, value on the right, on one line. */
-  private row(doc: PDFKit.PDFDocument, label: string, value: string) {
-    const y = doc.y;
-    doc.text(ascii(label), 50, y, { width: 200 });
-    doc.text(ascii(value), 250, y, { width: 310 });
-    doc.moveDown(0.35);
-  }
+  /**
+   * The same data as the CSV, as a real spreadsheet.
+   *
+   * CSV carries no formatting, so Excel opens date columns at its default
+   * width and renders them as "#####". A worksheet can set column widths,
+   * date and currency formats, and freeze the header, which CSV never can.
+   */
+  async transactionsXlsx(userId: string, query: QueryReportDto): Promise<Buffer> {
+    const rows = await this.scoped(userId, query).getMany();
 
-  /** Collects the document into a Buffer so Nest can send it in one response. */
-  private render(build: (doc: PDFKit.PDFDocument) => void): Promise<Buffer> {
-    return new Promise((resolve, reject) => {
-      const doc = new PDFDocument({ margin: 50, size: 'A4' });
-      const chunks: Buffer[] = [];
-
-      doc.on('data', (chunk: Buffer) => chunks.push(chunk));
-      doc.on('end', () => resolve(Buffer.concat(chunks)));
-      doc.on('error', reject);
-
-      try {
-        build(doc);
-        doc.end();
-      } catch (error) {
-        reject(error as Error);
-      }
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'FinSight';
+    workbook.created = new Date();
+    const sheet = workbook.addWorksheet('Transactions', {
+      views: [{ state: 'frozen', ySplit: 1 }],
     });
+
+    sheet.columns = [
+      { header: 'Date', key: 'date', width: 12 },
+      { header: 'Description', key: 'description', width: 38 },
+      { header: 'Merchant', key: 'merchant', width: 20 },
+      { header: 'Reference', key: 'reference', width: 16 },
+      { header: 'Category', key: 'category', width: 14 },
+      { header: 'Type', key: 'type', width: 10 },
+      { header: 'Amount', key: 'amount', width: 14 },
+      { header: 'Currency', key: 'currency', width: 9 },
+      { header: 'Original amount', key: 'originalAmount', width: 15 },
+      { header: 'Original currency', key: 'originalCurrency', width: 15 },
+      { header: 'Balance after', key: 'balanceAfter', width: 15 },
+      { header: 'Source', key: 'source', width: 9 },
+      { header: 'Needs review', key: 'needsReview', width: 13 },
+    ];
+
+    for (const t of rows) {
+      sheet.addRow({
+        // A real Date, not a string, so Excel can sort and filter by it.
+        date: new Date(`${t.date}T00:00:00Z`),
+        description: t.description,
+        merchant: t.merchant ?? '',
+        reference: t.reference ?? '',
+        category: t.category,
+        type: t.type,
+        amount: Number(t.amount),
+        currency: t.currency,
+        originalAmount: t.originalAmount != null ? Number(t.originalAmount) : null,
+        originalCurrency: t.originalCurrency ?? '',
+        balanceAfter: t.balanceAfter != null ? Number(t.balanceAfter) : null,
+        source: t.source,
+        needsReview: t.needsReview ? 'yes' : 'no',
+      });
+    }
+
+    const header = sheet.getRow(1);
+    header.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    header.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF644FEF' } };
+    header.alignment = { vertical: 'middle' };
+    header.height = 20;
+
+    sheet.getColumn('date').numFmt = 'yyyy-mm-dd';
+    for (const key of ['amount', 'originalAmount', 'balanceAfter']) {
+      sheet.getColumn(key).numFmt = '#,##0.00';
+    }
+    sheet.autoFilter = { from: 'A1', to: { row: 1, column: sheet.columnCount } };
+
+    return Buffer.from(await workbook.xlsx.writeBuffer());
   }
 }

@@ -35,6 +35,28 @@ export class ReportsController {
     res.send('\uFEFF' + csv);
   }
 
+  @Get('transactions.xlsx')
+  @ApiProduces('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+  async transactionsXlsx(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query() query: QueryReportDto,
+    @Res() res: Response,
+  ) {
+    const xlsx = await this.reports.transactionsXlsx(user.id, query);
+    const stamp = new Date().toISOString().slice(0, 10);
+
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    );
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="finsight-transactions-${stamp}.xlsx"`,
+    );
+    res.setHeader('Content-Length', xlsx.length);
+    res.end(xlsx);
+  }
+
   @Get('monthly.pdf')
   @ApiProduces('application/pdf')
   async monthlyPdf(

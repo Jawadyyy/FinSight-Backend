@@ -356,7 +356,33 @@ export function parseStatementText(text: string): ParseResult {
   return { rows, warnings, summary };
 }
 
+/** The file could not be opened as a PDF at all. */
+export class PdfUnreadableError extends Error {}
+
+/**
+ * The PDF opened, but carries no selectable text — the hallmark of a scan or a
+ * photo, where the page is an image and there is nothing to read.
+ */
+export class PdfNoTextLayerError extends Error {}
+
+/**
+ * Below this a page is not a statement. A real statement has hundreds of
+ * characters; a scan yields nothing, or a few stray marks from the encoder.
+ */
+const MIN_TEXT_CHARS = 20;
+
 export async function parsePdf(buffer: Buffer): Promise<ParseResult> {
-  const { text } = await pdf(buffer);
+  let text: string;
+
+  try {
+    ({ text } = await pdf(buffer));
+  } catch (error) {
+    throw new PdfUnreadableError((error as Error).message);
+  }
+
+  if (text.replace(/\s/g, '').length < MIN_TEXT_CHARS) {
+    throw new PdfNoTextLayerError('No selectable text found in the PDF.');
+  }
+
   return parseStatementText(text);
 }

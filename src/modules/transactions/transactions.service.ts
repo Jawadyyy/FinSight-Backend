@@ -14,7 +14,11 @@ import { CreateTransactionDto } from './dto/create-transaction.dto';
 import { UpdateTransactionDto } from './dto/update-transaction.dto';
 import { QueryTransactionsDto } from './dto/query-transactions.dto';
 import { parseCsv } from './upload/parse-csv';
-import { parsePdf } from './upload/parse-pdf';
+import {
+  parsePdf,
+  PdfNoTextLayerError,
+  PdfUnreadableError,
+} from './upload/parse-pdf';
 
 @Injectable()
 export class TransactionsService {
@@ -147,18 +151,45 @@ export class TransactionsService {
 
   async upload(userId: string, file: Express.Multer.File) {
     const mime = file.mimetype;
+    const isCsv = mime === 'text/csv' || file.originalname.endsWith('.csv');
+    const isPdf = mime === 'application/pdf' || file.originalname.endsWith('.pdf');
+
+    if (!isCsv && !isPdf) {
+      throw new BadRequestException('Only CSV and PDF files are supported.');
+    }
+
     let parsed: ParseResult;
 
-    if (mime === 'text/csv' || file.originalname.endsWith('.csv')) {
-      parsed = parseCsv(file.buffer);
-    } else if (mime === 'application/pdf' || file.originalname.endsWith('.pdf')) {
-      parsed = await parsePdf(file.buffer);
-    } else {
-      throw new BadRequestException('Only CSV and PDF files are supported');
+    // Every parse failure is the file's fault, not the server's, so each one
+    // becomes a 400 that says what to do about it. Without this a scan or a
+    // mislabelled file surfaces as an opaque 500.
+    try {
+      parsed = isCsv ? parseCsv(file.buffer) : await parsePdf(file.buffer);
+    } catch (error) {
+      if (error instanceof PdfNoTextLayerError) {
+        throw new BadRequestException(
+          'This PDF has no selectable text, so it looks like a scan or a photo. ' +
+            'FinSight reads the text of a statement, so please upload the PDF or ' +
+            'CSV your bank provides rather than a scanned copy.',
+        );
+      }
+      if (error instanceof PdfUnreadableError) {
+        throw new BadRequestException(
+          'This file could not be opened as a PDF. It may be damaged, password ' +
+            'protected, or saved in a format we cannot read.',
+        );
+      }
+      throw new BadRequestException(
+        (error as Error).message || 'The file could not be read.',
+      );
     }
 
     if (!parsed.rows.length) {
-      throw new BadRequestException('No transactions could be parsed from the file');
+      throw new BadRequestException(
+        isCsv
+          ? 'No transactions were found. Check the file has Date, Description and Amount columns.'
+          : 'No transactions were found in this PDF. The statement layout may not be supported yet.',
+      );
     }
 
     const source = file.originalname.endsWith('.pdf')

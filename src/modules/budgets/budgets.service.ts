@@ -6,6 +6,7 @@ import { CreateBudgetDto } from './dto/create-budget.dto';
 import { UpdateBudgetDto } from './dto/update-budget.dto';
 import { QueryBudgetsDto } from './dto/query-budgets.dto';
 import { Transaction } from '../transactions/entities/transaction.entity';
+import { firstOfNextMonth } from '../../common/utils/month-range';
 
 @Injectable()
 export class BudgetsService {
@@ -40,7 +41,10 @@ export class BudgetsService {
 
     const month = query.month ?? new Date().toISOString().slice(0, 7);
     const startDate = `${month}-01`;
-    const endDate = `${month}-31`;
+    // First day of the next month, compared with "<". Building an end date as
+    // `${month}-31` makes an impossible date for any 30-day month or February,
+    // which Postgres rejects outright.
+    const nextMonth = firstOfNextMonth(month);
 
     const spent: Record<string, number> = {};
     const rows = await this.txRepo
@@ -50,7 +54,7 @@ export class BudgetsService {
       .where('t.userId = :userId', { userId })
       .andWhere('t.type = :type', { type: 'expense' })
       .andWhere('t.date >= :startDate', { startDate })
-      .andWhere('t.date <= :endDate', { endDate })
+      .andWhere('t.date < :nextMonth', { nextMonth })
       .groupBy('t.category')
       .getRawMany<{ category: string; total: string }>();
 
