@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { In, IsNull, Not, Repository } from 'typeorm';
 import { createHash } from 'crypto';
 import { CategorizationService } from '../categorization/categorization.service';
+import { SubscriptionService } from '../subscription/subscription.service';
 import {
   Transaction,
   TransactionCategory,
@@ -26,6 +27,7 @@ export class TransactionsService {
     @InjectRepository(Transaction)
     private readonly repo: Repository<Transaction>,
     private readonly categorization: CategorizationService,
+    private readonly subscription: SubscriptionService,
   ) {}
 
   async create(userId: string, dto: CreateTransactionDto): Promise<Transaction> {
@@ -158,6 +160,10 @@ export class TransactionsService {
       throw new BadRequestException('Only CSV and PDF files are supported.');
     }
 
+    // Checked before parsing so someone over their limit is told straight
+    // away, rather than after waiting for a large statement to be read.
+    await this.subscription.assertCanUpload(userId);
+
     let parsed: ParseResult;
 
     // Every parse failure is the file's fault, not the server's, so each one
@@ -256,6 +262,10 @@ export class TransactionsService {
     );
 
     const saved = entities.length ? await this.repo.save(entities) : [];
+
+    // Spent only now: a statement that failed to parse should not cost the
+    // user one of their monthly uploads.
+    await this.subscription.recordUpload(userId);
 
     return {
       imported: saved.length,

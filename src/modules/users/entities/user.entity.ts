@@ -9,6 +9,9 @@ import {
 /** How the account signs in. 'local' = email + password, 'google' = Google OAuth. */
 export type AuthProvider = 'local' | 'google';
 
+/** Free is capped on uploads and has no AI insights; Pro has neither limit. */
+export type SubscriptionTier = 'free' | 'pro';
+
 @Entity('users')
 export class User {
   @PrimaryGeneratedColumn('uuid')
@@ -40,6 +43,24 @@ export class User {
    */
   @Column({ type: 'varchar', nullable: true })
   hashedRefreshToken?: string | null;
+
+  /** Which plan the account is on. Everyone starts free. */
+  @Column({ type: 'varchar', length: 10, default: 'free' })
+  tier!: SubscriptionTier;
+
+  /**
+   * Statement uploads used in `uploadsPeriod`.
+   *
+   * ponytail: a counter on the user rather than an uploads table — it answers
+   * "how many left this month?" in one read and needs no join. Add a table if
+   * you ever want upload history or per-file auditing.
+   */
+  @Column({ type: 'int', default: 0 })
+  uploadsUsed!: number;
+
+  /** The month the counter belongs to (YYYY-MM); a new month resets it. */
+  @Column({ type: 'varchar', length: 7, nullable: true })
+  uploadsPeriod?: string | null;
 
   @Column({ type: 'timestamp', nullable: true })
   lastLoginAt?: Date | null;

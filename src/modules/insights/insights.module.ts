@@ -4,9 +4,13 @@ import { Transaction } from '../transactions/entities/transaction.entity';
 import { Budget } from '../budgets/entities/budget.entity';
 import { InsightsService } from './insights.service';
 import { InsightsController } from './insights.controller';
+import { SubscriptionModule } from '../subscription/subscription.module';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([Transaction, Budget])],
+  imports: [
+    TypeOrmModule.forFeature([Transaction, Budget]),
+    SubscriptionModule,
+  ],
   controllers: [InsightsController],
   providers: [InsightsService],
   // The monthly PDF embeds the same insights the dashboard shows.

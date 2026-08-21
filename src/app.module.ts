@@ -10,6 +10,7 @@ import { BudgetsModule } from './modules/budgets/budgets.module';
 import { AnalyticsModule } from './modules/analytics/analytics.module';
 import { InsightsModule } from './modules/insights/insights.module';
 import { ReportsModule } from './modules/reports/reports.module';
+import { SubscriptionModule } from './modules/subscription/subscription.module';
 
 @Module({
   imports: [
@@ -37,6 +38,7 @@ import { ReportsModule } from './modules/reports/reports.module';
     AnalyticsModule,
     InsightsModule,
     ReportsModule,
+    SubscriptionModule,
   ],
   controllers: [AppController],
   providers: [AppService],
