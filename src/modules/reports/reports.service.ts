@@ -12,6 +12,7 @@ import { InsightsService } from '../insights/insights.service';
 import { QueryReportDto } from './dto/query-report.dto';
 import { renderMonthlyReport } from './pdf-report';
 import { lastDayOfMonth } from '../../common/utils/month-range';
+import { SubscriptionService } from '../subscription/subscription.service';
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -65,6 +66,7 @@ export class ReportsService {
     @InjectRepository(Budget)
     private readonly budgets: Repository<Budget>,
     private readonly insights: InsightsService,
+    private readonly subscription: SubscriptionService,
   ) {}
 
   private scoped(userId: string, query: QueryReportDto) {
@@ -160,10 +162,16 @@ export class ReportsService {
     const from = `${target}-01`;
     const to = lastDayOfMonth(target);
 
+    // AI insights are a Pro feature, so a free report is the plain one. Skipping
+    // the call also means free reports never wait on the model.
+    const { features } = await this.subscription.status(userId);
+
     const [rows, budgetRows, insights, monthly] = await Promise.all([
       this.scoped(userId, { from, to }).getMany(),
       this.budgets.find({ where: { userId, month: target }, order: { category: 'ASC' } }),
-      this.insights.forMonth(userId, target),
+      features.aiInsights
+        ? this.insights.forMonth(userId, target)
+        : Promise.resolve(null),
       this.monthlyTrend(userId, target, 6),
     ]);
 
@@ -210,12 +218,18 @@ export class ReportsService {
         limit: round2(Number(b.limit)),
         spent: totals.get(b.category) ?? 0,
       })),
-      insights: {
-        headline: insights.headline,
-        summary: insights.summary,
-        aiGenerated: insights.aiGenerated,
-        facts: insights.facts.map((f) => ({ severity: f.severity, message: f.message })),
-      },
+      // Empty facts and summary make the renderer omit the panel entirely.
+      insights: insights
+        ? {
+            headline: insights.headline,
+            summary: insights.summary,
+            aiGenerated: insights.aiGenerated,
+            facts: insights.facts.map((f) => ({
+              severity: f.severity,
+              message: f.message,
+            })),
+          }
+        : { headline: '', summary: '', aiGenerated: false, facts: [] },
       transactions: rows.map((t) => ({
         date: t.date,
         merchant: t.merchant ?? t.description,
